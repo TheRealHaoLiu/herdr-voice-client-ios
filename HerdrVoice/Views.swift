@@ -28,7 +28,7 @@ struct PairView: View {
         VStack(spacing: 20) {
             Spacer()
             Image(systemName: "waveform.circle.fill").font(.system(size: 72)).foregroundStyle(.tint)
-            Text("Herdr Voice").font(.largeTitle.bold())
+            Text("Herdr Voice Client").font(.largeTitle.bold())
             Text("On the Mac, right-click the Herdr Voice button and choose Connect a Phone. Then scan the code it shows.")
                 .multilineTextAlignment(.center).foregroundStyle(.secondary)
             Button { scanning = true } label: { Label("Scan the code", systemImage: "qrcode.viewfinder").frame(maxWidth: .infinity) }

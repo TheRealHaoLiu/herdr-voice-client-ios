@@ -116,7 +116,7 @@ final class Recorder {
 @MainActor
 final class Speaker: NSObject, AVAudioPlayerDelegate, AVSpeechSynthesizerDelegate {
     private var player: AVAudioPlayer?
-    private let synth = AVSpeechSynthesizer()
+    private var synth = AVSpeechSynthesizer()
     private(set) var busy = false
     private(set) var paused = false
     var finished: () -> Void = {}
@@ -157,7 +157,14 @@ final class Speaker: NSObject, AVAudioPlayerDelegate, AVSpeechSynthesizerDelegat
         let was = busy
         busy = false; paused = false
         player?.stop(); player = nil
-        if synth.isSpeaking || synth.isPaused { synth.stopSpeaking(at: .immediate) }
+        // A paused system voice ignores a stop: its line stays queued and is read again later.
+        // So it is let go first, stopped, and then replaced by a fresh one.
+        let old = synth
+        old.delegate = nil
+        if old.isPaused { old.continueSpeaking() }
+        if old.isSpeaking || old.isPaused { old.stopSpeaking(at: .immediate) }
+        synth = AVSpeechSynthesizer()
+        synth.delegate = self
         if was { finished() }
     }
 

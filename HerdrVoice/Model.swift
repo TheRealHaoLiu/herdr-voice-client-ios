@@ -126,7 +126,12 @@ final class Model: ObservableObject {
         for s in sessions where lines[s.address] == nil { await loadHistory(s.address) }
     }
 
+    private var loadingHistory: Set<String> = []
     private func loadHistory(_ t: String) async {
+        // Two callers can ask for the same session at once (the refresh loop, coming back to the
+        // app, opening the session). Only the first loads it; a second copy would double every line.
+        guard lines[t] == nil, !loadingHistory.contains(t) else { return }
+        loadingHistory.insert(t); defer { loadingHistory.remove(t) }
         guard let r = try? await api.call("/api/history" + API.query(t) + "&limit=30", timeout: 15) else { return } // tried again next time
         let known = heardUpTo[t]
         if known == nil { heardUpTo[t] = nowMs() } // a session seen for the first time has nothing missed
