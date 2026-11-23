@@ -1,6 +1,6 @@
 # herdr-voice-client-ios
 
-A hold-to-talk iPhone app for [herdr-voice](https://github.com/TheRealHaoLiu/herdr-voice): pick an
+A hold-to-talk iPhone app for [herdr-voice](https://github.com/TheRealHaoLiu/herdr-voice-server): pick an
 agent session, hold the button, talk, hear the reply. It talks to the herdr-voice server the same
 way the phone page and the CardputerZero client do, so the server needs no change. Unlike the page,
 it turns speech into text on the phone, and by default speaks replies with the phone's own voice.
