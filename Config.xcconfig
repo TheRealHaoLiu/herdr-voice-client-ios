@@ -1,0 +1,7 @@
+// Signing settings. Your own values go in Local.xcconfig, which git ignores:
+// copy Local.xcconfig.example to Local.xcconfig and fill it in. Set them there, not in
+// Xcode's Signing & Capabilities tab, which would write them into the project file.
+DEVELOPMENT_TEAM =
+PRODUCT_BUNDLE_IDENTIFIER = com.example.herdr-voice-client-ios
+
+#include? "Local.xcconfig"
