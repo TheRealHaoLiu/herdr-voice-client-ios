@@ -7,7 +7,7 @@ struct HerdrVoiceApp: App {
     @Environment(\.scenePhase) private var scene
     var body: some Scene {
         WindowGroup {
-            Group { if model.paired { MainView() } else { PairView() } }
+            Group { if model.paired { InboxView() } else { PairView() } }
                 .environmentObject(model)
                 .onAppear { model.start() }
                 .onChange(of: scene) { _, now in if now == .active, model.paired { Task { await model.refreshSessions() } } }
@@ -80,66 +80,125 @@ struct QRScanner: UIViewControllerRepresentable {
     }
 }
 
-// MARK: talking
+// MARK: the inbox: every agent session, the ones with something for you first
 
-struct MainView: View {
+struct InboxView: View {
     @EnvironmentObject var model: Model
-    @State private var typed = ""
     @State private var settings = false
-    @FocusState private var typing: Bool
-
-    private var lines: [Line] { model.target.flatMap { model.lines[$0] } ?? [] }
-    private var working: Bool { model.target.map { model.pending.contains($0) } ?? false }
 
     var body: some View {
         NavigationStack {
             VStack(spacing: 0) {
-                if !model.serverUp { Notice(text: model.serverWhy.isEmpty ? API.unreachable : model.serverWhy, color: .red) }
-                if case .loading = model.hearing { Notice(text: "Loading the speech model… (the first time downloads it)", color: .orange) }
-                if case .failed(let why) = model.hearing { Notice(text: "The speech model could not load. \(why)", color: .red) }
-                if let banner = model.banner { Notice(text: banner, color: .blue) }
-                conversation
-                if let t = model.target, let ask = model.asks[t] { AskCard(ask: ask) }
-                controls
+                Notices()
+                List {
+                    ForEach(model.inbox) { s in
+                        NavigationLink(value: s.address) { InboxRow(session: s) }
+                            .swipeActions(edge: .trailing) {
+                                if model.unread(s.address) > 0 { Button("Heard") { model.markAllHeard(s.address) }.tint(.blue) }
+                            }
+                    }
+                    if model.sessions.isEmpty {
+                        Text(model.serverUp ? "No agent sessions are running." : "Waiting for the voice server…").foregroundStyle(.secondary)
+                    }
+                }
+                .listStyle(.plain)
+                .refreshable { await model.refreshSessions() }
             }
-            .navigationBarTitleDisplayMode(.inline)
-            .toolbar {
-                ToolbarItem(placement: .principal) { sessionMenu }
-                ToolbarItem(placement: .topBarTrailing) { Button { settings = true } label: { Image(systemName: "gearshape") } }
-            }
+            .navigationTitle("Agents")
+            .navigationDestination(for: String.self) { ConversationView(address: $0) }
+            .toolbar { ToolbarItem(placement: .topBarTrailing) { Button { settings = true } label: { Image(systemName: "gearshape") } } }
             .sheet(isPresented: $settings) { SettingsView() }
         }
     }
+}
 
-    private var sessionMenu: some View {
-        Menu {
-            let machines = Dictionary(grouping: model.sessions, by: \.machine)
-            ForEach(machines.keys.sorted(), id: \.self) { machine in
-                Section(machine) {
-                    ForEach(machines[machine] ?? []) { s in
-                        Button { model.select(s.address) } label: {
-                            Label("\(s.label) · \(s.status)", systemImage: s.address == model.target ? "checkmark" : dot(s.status))
-                        }
-                    }
+struct InboxRow: View {
+    @EnvironmentObject var model: Model
+    let session: Session
+    var body: some View {
+        let missed = model.unread(session.address), last = model.lastLine(session.address)
+        HStack(alignment: .top, spacing: 12) {
+            Circle().fill(statusColor(session.status)).frame(width: 10, height: 10).padding(.top, 6)
+            VStack(alignment: .leading, spacing: 3) {
+                HStack {
+                    Text(session.label).font(.headline).fontWeight(missed > 0 ? .bold : .semibold).lineLimit(1)
+                    Spacer()
+                    if let last { Text(Date(timeIntervalSince1970: last.at / 1000).formatted(date: .omitted, time: .shortened)).font(.caption).foregroundStyle(.secondary) }
+                }
+                Text([session.machine, session.status].filter { !$0.isEmpty }.joined(separator: " · ")).font(.caption).foregroundStyle(.secondary)
+                if let last {
+                    Text((last.who == .me ? "You: " : "") + last.text).font(.subheadline).lineLimit(2)
+                        .foregroundStyle(missed > 0 ? .primary : .secondary)
                 }
             }
-            if model.sessions.isEmpty { Text("No agent sessions are running.") }
-        } label: {
-            HStack(spacing: 6) {
-                Circle().fill(color(model.current?.status ?? "")).frame(width: 9, height: 9)
-                Text(model.current?.label ?? "Pick a session").font(.headline).lineLimit(1)
-                Image(systemName: "chevron.down").font(.caption)
+            VStack(spacing: 6) {
+                if missed > 0 {
+                    Text("\(missed)").font(.caption.bold()).foregroundStyle(.white)
+                        .padding(.horizontal, 8).padding(.vertical, 3).background(Color.accentColor, in: Capsule())
+                }
+                if session.status == "blocked" { Image(systemName: "hand.raised.fill").foregroundStyle(.orange) }
             }
         }
+        .padding(.vertical, 4)
     }
-    private func dot(_ status: String) -> String { status == "working" ? "circle.dotted" : status == "blocked" ? "exclamationmark.circle" : "circle" }
-    private func color(_ status: String) -> Color { status == "working" ? .orange : status == "blocked" ? .red : status.isEmpty ? .gray : .green }
+}
+
+func statusColor(_ status: String) -> Color { status == "working" ? .orange : status == "blocked" ? .red : status.isEmpty ? .gray : .green }
+
+/// What is wrong or still loading, shown on both screens.
+struct Notices: View {
+    @EnvironmentObject var model: Model
+    var body: some View {
+        VStack(spacing: 0) {
+            if !model.serverUp { Notice(text: model.serverWhy.isEmpty ? API.unreachable : model.serverWhy, color: .red) }
+            if case .loading = model.hearing { Notice(text: "Loading the speech model… (the first time downloads it)", color: .orange) }
+            if case .failed(let why) = model.hearing { Notice(text: "The speech model could not load. \(why)", color: .red) }
+            if let banner = model.banner { Notice(text: banner, color: .blue) }
+        }
+    }
+}
+
+// MARK: one session: talk to it, hear it, play things again
+
+struct ConversationView: View {
+    @EnvironmentObject var model: Model
+    let address: String
+    @State private var typed = ""
+    @FocusState private var typing: Bool
+
+    private var session: Session? { model.sessions.first { $0.address == address } }
+    private var lines: [Line] { model.lines[address] ?? [] }
+    private var working: Bool { model.pending.contains(address) }
+
+    var body: some View {
+        VStack(spacing: 0) {
+            Notices()
+            conversation
+            if let ask = model.asks[address] { AskCard(ask: ask) }
+            controls
+        }
+        .navigationBarTitleDisplayMode(.inline)
+        .toolbar {
+            ToolbarItem(placement: .principal) {
+                HStack(spacing: 6) {
+                    Circle().fill(statusColor(session?.status ?? "")).frame(width: 9, height: 9)
+                    Text(session?.label ?? address).font(.headline).lineLimit(1)
+                }
+            }
+            ToolbarItem(placement: .topBarTrailing) {
+                Button { model.hush() } label: { Image(systemName: "speaker.slash") }
+                    .disabled(!model.speaking).accessibilityLabel("Stop speaking")
+            }
+        }
+        .onAppear { model.open(address) }
+        .onDisappear { model.close(address) }
+    }
 
     private var conversation: some View {
         ScrollViewReader { proxy in
             ScrollView {
                 LazyVStack(alignment: .leading, spacing: 10) {
-                    ForEach(lines) { Bubble(line: $0) }
+                    ForEach(lines) { line in Bubble(line: line) { model.replay(line, in: address) } }
                     if model.phase != .idle {
                         Bubble(line: Line(who: .me, text: model.liveWords.isEmpty ? (model.phase == .recording ? "Listening…" : "…") : model.liveWords)).opacity(0.6)
                     }
@@ -151,7 +210,6 @@ struct MainView: View {
             .scrollDismissesKeyboard(.interactively)
             .onChange(of: lines.count) { _, _ in withAnimation { proxy.scrollTo("end") } }
             .onChange(of: model.liveWords) { _, _ in proxy.scrollTo("end") }
-            .onChange(of: model.target) { _, _ in proxy.scrollTo("end") }
             .onAppear { proxy.scrollTo("end") }
         }
     }
@@ -199,17 +257,26 @@ struct TalkButton: View {
     }
 }
 
+/// One line of the conversation. Tapping something an agent said plays it again.
 struct Bubble: View {
     let line: Line
+    var replay: (() -> Void)? = nil
     var body: some View {
         switch line.who {
         case .me: HStack { Spacer(minLength: 40); text.padding(10).background(Color.accentColor.opacity(0.9), in: RoundedRectangle(cornerRadius: 14)).foregroundStyle(.white) }
-        case .agent: HStack { text.padding(10).background(Color(.secondarySystemBackground), in: RoundedRectangle(cornerRadius: 14)); Spacer(minLength: 40) }
+        case .agent:
+            HStack(alignment: .top, spacing: 6) {
+                text.padding(10).background(Color(.secondarySystemBackground), in: RoundedRectangle(cornerRadius: 14))
+                    .onTapGesture { replay?() }
+                    .accessibilityHint("Plays it again")
+                if line.unread { Circle().fill(Color.accentColor).frame(width: 9, height: 9).padding(.top, 8) }
+                Spacer(minLength: 30)
+            }
         case .note: text.font(.footnote).foregroundStyle(.secondary).frame(maxWidth: .infinity, alignment: .center)
         case .problem: text.font(.footnote).foregroundStyle(.red).frame(maxWidth: .infinity, alignment: .center)
         }
     }
-    private var text: some View { Text(line.text).textSelection(.enabled) }
+    private var text: some View { Text(line.text) }
 }
 
 struct AskCard: View {
@@ -264,13 +331,14 @@ struct SettingsView: View {
                         }
                     }
                 } header: { Text("Replies are spoken by") } footer: {
-                    Text("The iPhone voice starts at once. The Mac's voice sounds the same as on your other devices but takes one more trip to the server. The experimental one runs the Mac's voice engine on this phone; its makers flag it as able to crash the app on this iOS version.")
+                    Text("The iPhone voice starts at once. The Mac's voice sounds the same as on your other devices but takes one more trip to the server; things played again use the iPhone voice. The experimental one runs the Mac's voice engine on this phone; its makers flag it as able to crash the app on this iOS version.")
                 }
-                Section { Toggle("Agents can speak up by themselves", isOn: $model.announceOn) }
-                Section("Server") {
+                Section {
                     LabeledContent("Address", value: Store.server ?? "none")
                     LabeledContent("This phone", value: Store.clientId)
                     Button("Unpair this phone", role: .destructive) { confirmUnpair = true }
+                } header: { Text("Server") } footer: {
+                    Text("Only the session you have open speaks. What other sessions say waits in the list as unread and plays when you open them.")
                 }
             }
             .navigationTitle("Settings").navigationBarTitleDisplayMode(.inline)

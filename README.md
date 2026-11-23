@@ -6,19 +6,22 @@ way the phone page and the CardputerZero client do, so the server needs no chang
 it turns speech into text on the phone, and by default speaks replies with the phone's own voice.
 
 Status (2026-11-23): first version, built with Xcode 27.2 and installed on an iPhone 16 Pro.
-Seen working there: pairing, hold-to-talk with speech turned into text on the phone, and the words
-reaching an agent session. Not yet checked by anyone: the three voices side by side, Allow and
-Deny, Stop, Send now, announcements, and what happens when the screen locks. Design and reasons:
-`DESIGN.md`.
+Seen working there: pairing, hold-to-talk with speech turned into text on the phone, the words
+reaching an agent session, and replies spoken. Built but not yet checked by anyone: the inbox and
+playing missed lines, playing a line again, Allow and Deny, Stop, Send now. Known gap: nothing
+plays once the screen locks. Design and reasons: `DESIGN.md`.
 
 ## What it does
 
 - Pairs by scanning the code from the Mac app's "Connect a Phone" window (or a pasted pairing link).
-- Lists agent sessions by machine, with each one's state.
+- Opens on an inbox of agent sessions: each one's state, its last line, and a count of what it
+  said that you have not heard. Sessions with something for you come first.
+- One voice at a time: only the session you have open speaks. What the others say waits in the
+  inbox, with a tap of haptics instead of a voice.
+- Open a session and it plays what you missed, in order. Tap anything an agent said to hear it again.
 - Hold to talk, with the words appearing while you speak.
 - Shows the reply and says it. Three voices to choose from in Settings.
 - Allow and Deny for permission prompts; Stop; Send now; a line for typing (slash commands too).
-- Agents that speak up by themselves are heard, named first.
 
 ## What you need
 
@@ -45,7 +48,7 @@ Compile check without signing:
 - `HerdrVoice/API.swift`: the server calls, pairing, and where the key is kept (Keychain).
 - `HerdrVoice/Speech.swift`: speech-to-text, the microphone, and the three ways a reply is spoken.
 - `HerdrVoice/Model.swift`: what a hold, a typed line or a tap sets off.
-- `HerdrVoice/Views.swift`: the screens.
+- `HerdrVoice/Views.swift`: the screens (pairing, the inbox, one session, settings).
 - `Info.plist`: the two settings Xcode cannot generate (local plain-HTTP for pairing, background audio).
 - `Config.xcconfig`, `Local.xcconfig.example`: signing settings (see Build and run).
 - `tools/icon.swift`: draws the app icon (`swift tools/icon.swift <out.png>`).

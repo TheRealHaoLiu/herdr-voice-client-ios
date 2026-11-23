@@ -1,6 +1,9 @@
 // Everything the screen shows and everything a hold, a typed line or a tap sets off.
 // A thin client: the server decides what a turn is; this file follows server.ts's replies the way
 // the Mac app (herdr-voice/mac) does, with speech done on the phone.
+//
+// One voice at a time: only the session that is open on screen speaks. What any other session says
+// is kept in its conversation as unread, counted in the inbox, and played when you open it.
 import AVFoundation
 import SwiftUI
 import UIKit
@@ -18,11 +21,16 @@ struct Session: Identifiable, Equatable {
     }
 }
 
+func nowMs() -> Double { Date().timeIntervalSince1970 * 1000 }
+
 struct Line: Identifiable, Equatable {
     enum Who { case me, agent, note, problem }
     let id = UUID()
     let who: Who
     var text: String
+    var at: Double = nowMs() // when it was said, in milliseconds
+    var unread = false       // an agent's line that has not been played on this phone yet
+    var live = true          // arrived while the app was running: its time is the phone's clock, not the server's
 }
 
 /// A permission prompt a session has stopped on.
@@ -52,7 +60,7 @@ final class Model: ObservableObject {
     @Published var sessions: [Session] = []
     @Published var serverUp = true
     @Published var serverWhy = "" // why the last call to the server failed
-    @Published var target: String? { didSet { defaults.set(target, forKey: "session") } }
+    @Published var target: String? // the session open on screen; nil while the inbox is showing
     @Published var lines: [String: [Line]] = [:]
     @Published var asks: [String: Ask] = [:]
     @Published var pending: Set<String> = [] { didSet { UIApplication.shared.isIdleTimerDisabled = !pending.isEmpty } }
@@ -61,19 +69,20 @@ final class Model: ObservableObject {
     @Published var hearing = Loading.no
     @Published var kokoro = Loading.no
     @Published var banner: String?
+    @Published var speaking = false
     @Published var voice: Voice { didSet { defaults.set(voice.rawValue, forKey: "voice"); if voice == .kokoro { Task { await loadKokoro() } } } }
     @Published var kokoroVoice: String { didSet { defaults.set(kokoroVoice, forKey: "kokoroVoice") } }
-    @Published var announceOn: Bool { didSet { defaults.set(!announceOn, forKey: "announceOff") } }
+    /// Per session: the time of the newest line already played on this phone. Kept across launches,
+    /// so what an agent said while the app was closed can be told apart from what was heard.
+    private var heardUpTo: [String: Double] { didSet { defaults.set(heardUpTo, forKey: "heardUpTo") } }
 
     init() {
-        target = defaults.string(forKey: "session")
         voice = Voice(rawValue: defaults.string(forKey: "voice") ?? "") ?? .phone
         kokoroVoice = defaults.string(forKey: "kokoroVoice") ?? "am_echo"
-        announceOn = !defaults.bool(forKey: "announceOff")
-        speaker.finished = { [weak self] in self?.speakingFrom = nil; self?.playNext() }
+        heardUpTo = (defaults.dictionary(forKey: "heardUpTo") as? [String: Double]) ?? [:]
+        speaker.finished = { [weak self] in self?.speaking = false; self?.playNext() }
     }
 
-    var current: Session? { sessions.first { $0.address == target } }
     func name(_ t: String) -> String { sessions.first { $0.address == t }?.label ?? t }
     /// A client that voices replies itself tells the server not to make a clip.
     private var noClip: String { voice == .mac ? "" : "&audio=0" }
@@ -101,9 +110,9 @@ final class Model: ObservableObject {
     }
 
     func unpair() {
-        speaker.stop(); waiting.removeAll()
+        waiting.removeAll(); speaker.stop()
         Store.forget()
-        paired = false; started = false
+        paired = false; started = false; target = nil
         sessions = []; lines = [:]; asks = [:]; pending = []
     }
 
@@ -113,35 +122,107 @@ final class Model: ObservableObject {
         guard let list = r["sessions"] as? [[String: Any]] else { serverUp = false; serverWhy = (r["error"] as? String) ?? "The server sent something unreadable."; return }
         serverUp = true
         sessions = list.compactMap(Session.init)
-        if target == nil || !sessions.contains(where: { $0.address == target }) {
-            if let first = sessions.first?.address { select(first) }
-        } else if let t = target, lines[t] == nil { select(t) }
+        // Each session's recent history is read once, which is also how missed lines are found.
+        for s in sessions where lines[s.address] == nil { await loadHistory(s.address) }
     }
 
-    func select(_ t: String) {
+    private func loadHistory(_ t: String) async {
+        guard let r = try? await api.call("/api/history" + API.query(t) + "&limit=30", timeout: 15) else { return } // tried again next time
+        let known = heardUpTo[t]
+        if known == nil { heardUpTo[t] = nowMs() } // a session seen for the first time has nothing missed
+        let old: [Line] = ((r["items"] as? [[String: Any]]) ?? []).compactMap { item in
+            guard let text = item["text"] as? String else { return nil }
+            let at = (item["at"] as? Double) ?? 0
+            switch item["who"] as? String {
+            case "me": return Line(who: .me, text: text, at: at, live: false)
+            case "agent":
+                // The server marks an agent speaking up unasked with `from`. One of those, newer than
+                // the last thing played here, was missed. Replies to turns asked from other devices
+                // carry no `from` and are not counted: they were heard there.
+                let missed = item["from"] != nil && known.map { at > $0 } == true
+                return Line(who: .agent, text: text, at: at, unread: missed, live: false)
+            default: return Line(who: .note, text: text, at: at, live: false)
+            }
+        }
+        lines[t] = old + (lines[t] ?? [])
+    }
+
+    // MARK: the inbox
+
+    func unread(_ t: String) -> Int { lines[t]?.reduce(0) { $0 + ($1.unread ? 1 : 0) } ?? 0 }
+    func lastLine(_ t: String) -> Line? { lines[t]?.last { $0.who == .agent || $0.who == .me } }
+    /// Sessions that have something for you first, then the server's order (most recently active first).
+    var inbox: [Session] {
+        sessions.enumerated().sorted { a, b in
+            let wa = unread(a.element.address) > 0 || a.element.status == "blocked", wb = unread(b.element.address) > 0 || b.element.status == "blocked"
+            return wa != wb ? wa : a.offset < b.offset
+        }.map(\.element)
+    }
+
+    /// A session comes on screen: it becomes the one that speaks, and what you missed from it is played.
+    func open(_ t: String) {
+        if target != t { waiting.removeAll(); if speaker.busy { speaker.stop() } }
         target = t
         Task {
             if lines[t] == nil { await loadHistory(t) }
+            guard target == t else { return }
+            playMissed(t)
             // A session already stopped on a prompt: show it again, as a reloaded page does.
             if let r = try? await api.call("/api/screen" + API.query(t), timeout: 15), let ask = Ask(r["ask"]) { asks[t] = ask }
         }
     }
 
-    private func loadHistory(_ t: String) async {
-        guard let r = try? await api.call("/api/history" + API.query(t) + "&limit=30", timeout: 15) else { return }
-        let old: [Line] = ((r["items"] as? [[String: Any]]) ?? []).compactMap {
-            guard let text = $0["text"] as? String else { return nil }
-            switch $0["who"] as? String { case "me": return Line(who: .me, text: text); case "agent": return Line(who: .agent, text: text); default: return Line(who: .note, text: text) }
+    /// Back to the inbox: nothing speaks. Lines not played yet stay unread for the next visit.
+    func close(_ t: String) {
+        guard target == t else { return }
+        cancelHold()
+        target = nil
+        waiting.removeAll()
+        if speaker.busy { speaker.stop() }
+    }
+
+    private func playMissed(_ t: String) {
+        for line in lines[t] ?? [] where line.unread && !waiting.contains(where: { $0.line == line.id }) {
+            waiting.append(Utterance(words: line.text, clip: nil, line: line.id, session: t))
         }
-        lines[t] = old + (lines[t] ?? [])
+        playNext()
+    }
+
+    /// Say a line again.
+    func replay(_ line: Line, in t: String) {
+        guard phase == .idle else { return }
+        waiting.insert(Utterance(words: line.text, clip: nil, line: line.id, session: t), at: 0)
+        if speaker.busy { speaker.stop() } else { playNext() } // stopping moves on to the next in line, which is this one
+    }
+
+    func markAllHeard(_ t: String) {
+        for i in (lines[t] ?? []).indices { lines[t]![i].unread = false }
+        heardUpTo[t] = nowMs()
+        if t == target { hush() }
+    }
+
+    /// Stop talking and drop what was waiting to be said; all of it counts as heard.
+    func hush() {
+        for u in waiting { if let id = u.line { heard(id, in: u.session) } }
+        waiting.removeAll()
+        if speaker.busy { speaker.stop() }
+    }
+
+    private func heard(_ id: UUID, in t: String) {
+        guard let i = lines[t]?.firstIndex(where: { $0.id == id }) else { return }
+        lines[t]![i].unread = false
+        let line = lines[t]![i]
+        // A live line's time is this phone's clock; two seconds of slack keep the server's copy of the
+        // same line from counting as missed at the next launch if the clocks differ a little.
+        heardUpTo[t] = max(heardUpTo[t] ?? 0, line.at + (line.live ? 2000 : 0))
     }
 
     // MARK: what is on screen
 
     @discardableResult
-    private func add(_ who: Line.Who, _ text: String, to t: String?) -> UUID? {
+    private func add(_ who: Line.Who, _ text: String, to t: String?, unread: Bool = false) -> UUID? {
         guard let t, !text.isEmpty else { if who == .problem { flash(text) }; return nil }
-        let line = Line(who: who, text: text)
+        let line = Line(who: who, text: text, unread: unread)
         lines[t, default: []].append(line)
         if lines[t]!.count > 200 { lines[t]!.removeFirst(lines[t]!.count - 200) }
         return line.id
@@ -179,7 +260,7 @@ final class Model: ObservableObject {
     func holdBegan() {
         guard phase == .idle, !wantRecording else { return }
         guard hearing == .ready else { flash(hearing == .loading ? "The speech model is still loading." : "The speech model is not loaded."); return }
-        guard target != nil else { flash("Pick a session first."); return }
+        guard target != nil else { return }
         wantRecording = true
         speaker.pause() // talking pauses whatever is being said
         Task {
@@ -227,6 +308,14 @@ final class Model: ObservableObject {
         }
     }
 
+    /// Leaving the conversation mid-hold: the recording is thrown away.
+    private func cancelHold() {
+        wantRecording = false
+        liveTask?.cancel(); liveTask = nil
+        if phase == .recording { _ = recorder.stop() }
+        if phase != .hearing { phase = .idle; liveWords = "" }
+    }
+
     func sendTyped(_ text: String) {
         let words = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !words.isEmpty, let t = target else { return }
@@ -236,8 +325,7 @@ final class Model: ObservableObject {
     // MARK: a turn
 
     private func send(_ text: String, to t: String, spoken: Bool) async {
-        // You have answered the session that was speaking: drop the rest of what it was saying.
-        if speakingFrom == t { waiting.removeAll { $0.from == t }; speaker.stop() } else { speaker.resume(); playNext() }
+        if t == target { hush() } // you have answered the session that was speaking: the rest of it is dropped
         let mine = add(.me, text, to: t)
         let wasPending = pending.contains(t)
         pending.insert(t)
@@ -259,20 +347,21 @@ final class Model: ObservableObject {
         await refreshSessions()
     }
 
-    /// Puts one reply from the server on screen and in the speech queue. True if it gave the user anything.
+    /// Puts one reply from the server on screen and, for the open session, in the speech queue.
+    /// True if it gave the user anything.
     @discardableResult
     private func show(_ r: [String: Any], from t: String) -> Bool {
         var gave = (r["narrated"] as? Bool) == true || (r["command"] as? Bool) == true
         let ask = Ask(r["ask"])
         if let note = r["note"] as? String, !note.isEmpty { add(.note, note, to: t); gave = true }
         if let words = r["spoken"] as? String, !words.isEmpty {
-            add(.agent, words, to: t); gave = true
-            speak(words, clip: (r["audio"] as? String).flatMap { Data(base64Encoded: $0) }, from: t)
+            deliver(words, clip: (r["audio"] as? String).flatMap { Data(base64Encoded: $0) }, to: t); gave = true
         }
         if let ask {
             asks[t] = ask; gave = true
             let clip = ((r["ask"] as? [String: Any])?["audio"] as? String).flatMap { Data(base64Encoded: $0) }
-            if !ask.say.isEmpty { speak(ask.say, clip: clip, from: t) }
+            if t != target { UINotificationFeedbackGenerator().notificationOccurred(.warning) }
+            else if !ask.say.isEmpty { waiting.append(Utterance(words: ask.say, clip: clip, line: nil, session: t)); playNext() }
         } else if let problem = r["error"] as? String, !problem.isEmpty { add(.problem, problem, to: t); gave = true }
         return gave
     }
@@ -303,8 +392,7 @@ final class Model: ObservableObject {
 
     func stopTask() {
         guard let t = target else { return }
-        waiting.removeAll { $0.from == t }
-        if speakingFrom == t { speaker.stop() }
+        hush()
         Task {
             let r = try? await api.call("/api/stop" + API.query(t), method: "POST", timeout: 30)
             add(.note, (r?["stopped"] as? Bool) == true ? "Stopped." : "Could not stop it.", to: t)
@@ -322,33 +410,34 @@ final class Model: ObservableObject {
 
     // MARK: saying things, one at a time
 
-    private struct Utterance { let words: String; let clip: Data?; let from: String? }
+    private struct Utterance { let words: String; let clip: Data?; let line: UUID?; let session: String }
     private var waiting: [Utterance] = []
-    private var speakingFrom: String?
     private var preparing = false
 
-    private func speak(_ words: String, clip: Data?, from: String?) {
-        waiting.append(Utterance(words: words, clip: clip, from: from))
-        playNext()
+    /// An agent's words arriving. They are shown in its session. If that session is the open one they
+    /// are spoken; otherwise they wait there as unread, with a tap on the wrist instead of a voice.
+    private func deliver(_ words: String, clip: Data?, to t: String) {
+        guard let id = add(.agent, words, to: t, unread: true) else { return }
+        if t == target { waiting.append(Utterance(words: words, clip: clip, line: id, session: t)); playNext() }
+        else { UINotificationFeedbackGenerator().notificationOccurred(.success) }
     }
 
     private func playNext() {
         guard phase == .idle, !speaker.busy, !preparing, !waiting.isEmpty else { return }
         let next = waiting.removeFirst()
-        speakingFrom = next.from
-        // Several sessions can be working at once: a line from one that is not on screen is named first.
-        let words = next.from.flatMap { $0 != target ? "From \(name($0)). \(next.words)" : nil } ?? next.words
+        if let id = next.line { heard(id, in: next.session) } // a line counts as heard once it starts playing
+        speaking = true
         switch voice {
-        case .phone: speaker.say(words)
-        case .mac: if let clip = next.clip { speaker.play(clip: clip) } else { speaker.say(words) }
+        case .phone: speaker.say(next.words)
+        case .mac: if let clip = next.clip { speaker.play(clip: clip) } else { speaker.say(next.words) }
         case .kokoro:
-            guard kokoro == .ready else { speaker.say(words); return }
+            guard kokoro == .ready else { speaker.say(next.words); return }
             preparing = true
             Task {
-                let clip = try? await LocalSpeech.shared.speak(words, voice: kokoroVoice)
+                let clip = try? await LocalSpeech.shared.speak(next.words, voice: kokoroVoice)
                 preparing = false
-                guard phase == .idle else { waiting.insert(next, at: 0); speakingFrom = nil; return } // you started talking meanwhile
-                if let clip { speaker.play(clip: clip) } else { speaker.say(words) }
+                guard phase == .idle, target == next.session else { speaking = false; return } // you started talking, or left, meanwhile
+                if let clip { speaker.play(clip: clip) } else { speaker.say(next.words) }
             }
         }
     }
@@ -366,19 +455,12 @@ final class Model: ObservableObject {
             if last < 0 || e != epoch { last = (epoch != 0 && e != epoch) ? 0 : ((r["last"] as? Int) ?? 0); epoch = e; continue }
             for item in (r["items"] as? [[String: Any]]) ?? [] {
                 last = max(last, (item["id"] as? Int) ?? last)
-                let body = (item["text"] as? String) ?? "", address = item["address"] as? String
+                let body = (item["text"] as? String) ?? ""
+                guard !body.isEmpty, let t = (item["address"] as? String) ?? target else { continue }
                 let clip = (item["audio"] as? String).flatMap { Data(base64Encoded: $0) }
-                guard !body.isEmpty else { continue }
-                if (item["kind"] as? String) == "progress" { // narration during a turn asked from this phone
-                    add(.agent, body, to: address ?? target)
-                    speak(body, clip: clip, from: address)
-                    continue
-                }
-                guard announceOn else { continue }
-                let who = (item["from"] as? String) ?? "an agent"
-                add(.agent, body, to: address ?? target)
-                if address != target { flash("From \(who): \(body)", seconds: 8) }
-                if (item["play"] as? Bool) != false { speak("From \(who). \(body)", clip: clip, from: nil) } // another device may be the one saying it
+                // play:false means another of your devices is the one saying it: shown here, already heard there.
+                if (item["kind"] as? String) != "progress", (item["play"] as? Bool) == false { add(.agent, body, to: t); continue }
+                deliver(body, clip: clip, to: t)
             }
         }
     }

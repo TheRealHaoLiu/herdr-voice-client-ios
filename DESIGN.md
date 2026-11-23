@@ -43,13 +43,34 @@ it). With the "Mac's voice" setting the app leaves it off and plays the server's
 - **Talking pauses a reply; answering the session that was speaking drops the rest of it**, as in
   the Mac app. This also keeps the app's own voice out of the microphone.
 
+- **One voice at a time, and an inbox** (owner's call, 2026-11-23: voices from several agents
+  talking over each other were confusing; wanted a page showing who said something, where opening
+  one plays what was missed). Only the session open on screen speaks. Anything another session says
+  is added to its conversation as unread and counted in the inbox. Opening a session plays its
+  unread lines in order; a line counts as heard when it starts playing. Leaving a session stops the
+  voice, and what had not started stays unread.
+- **Play again by tapping a line.** Possible because the voice is made on the phone. With the
+  "Mac's voice" setting a replayed line uses the iPhone voice, since the server's clip is not kept.
+- **What was missed while the app was closed comes from the server's history, with no server
+  change.** History marks an agent speaking up unasked with a `from` field; replies to a turn do not
+  have it. So at launch each session's history is read once, and an unasked line newer than the
+  last thing played on this phone (a time kept per session on the phone) is unread. Replies to turns
+  asked from another device are not counted: they were heard there. A session seen for the first
+  time starts with nothing unread.
+- **The "agents can speak up" switch is gone**: the inbox replaces it.
+
 ## Rejected
 
+- Naming the session before each line ("From <name>. ...") and letting every session speak: that
+  was the first build, and it is what the inbox replaced.
 - Sending clips to the server for speech (`/api/hear`), as the page and the Cardputer do: the round
   trip is what on-device speech removes.
 - Kokoro on the phone as the default voice: see the crash flag above.
 
 ## Not built (second version)
+
+- Playing anything once the screen locks (seen 2026-11-23: it goes quiet). iOS suspends the app
+  seconds after the lock unless sound is already playing. See open question 4.
 
 - Talking from the Action Button: the app offers a Talk action to assign there. iOS reports a press,
   not a hold and release, so it becomes press to start, then press again or a pause in speech to send.
@@ -69,3 +90,7 @@ it). With the "Mac's voice" setting the app leaves it off and plays the server's
 4. What happens to a turn in flight when the screen locks. Background audio is switched on, which
    keeps the app alive only while something is playing.
 5. Bluetooth headsets: output works through them, the microphone is always the phone's.
+6. A reply to a turn asked from this phone, not yet played when the app is closed, is not unread
+   at the next launch (only unasked lines are found in history). Whether that matters in use.
+7. Lines the Mac said aloud while the phone was away also show as missed here; the server does not
+   record which device played a line. Swipe a session to mark it heard.
